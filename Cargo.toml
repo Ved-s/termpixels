@@ -1,0 +1,9 @@
+[package]
+name = "termpixels"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+paste = "1.0.15"
+rand = "0.8.5"
+termsize = "0.1.8"
