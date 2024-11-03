@@ -1,7 +1,7 @@
 pub mod vector;
 
 use std::{
-    io::{stdin, Read, Write},
+    io::{self, Read, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -19,29 +19,44 @@ use vector::{Vec2isize, Vec2usize};
 fn main() {
     std::io::stdout().write_all(b"\x1b[2J").ok();
 
+    // whether to update distances immediately or double-buffer them
+    // double-buffering makes distance propagation visible
     const IMMEDIATE_DISTANCES: bool = false;
+
+    // whether to update distances top-down left to right (false)
+    // or starting from the root point and moving avay from it (true)
+    // basically, no difference if IMMEDIATE_DISTANCES is false
     const DISTANCES_DIRECTIONAL: bool = false;
+
+    // whether to allow crossing (and deleting) "walls" of the maze
     const NO_WALL_JUMPS: bool = false;
+
     const JUMP_HEIGHT: f32 = 1.0;
     const RELATIVE_JUMP_HEIGHT: bool = true;
 
-    const CONTINUE_MOVING_CHANCE_DIV: usize = 30;
-    const PARTICLE_CHANCE_DIV: usize = 30;
+    // the bigger the value, bigger change to continue moving in a straight line
+    const CONTINUE_MOVING_CHANCE_DIV: usize = 5;
+
+    // whether to create "particles" that will run away from the root
+    const PARTICLES: bool = false;
+
+    // less value - more particles
+    const PARTICLE_CHANCE_DIV: usize = 100;
+
     const MOVE_DELAY: usize = 1;
-    const PARTICLES: bool = true;
+    const TARGET_FPS: f32 = 60.0;
 
     let size = termsize::get().expect("terminal size");
-    let size = Vec2usize::new(size.cols as usize, (size.rows as usize - 1) * 2);
+    let size = Vec2usize::new(size.cols as usize, (size.rows as usize - 2) * 2);
     let sizei = size.convert(|v| v as isize);
 
-    let mut maze = Field2d::new(size.x, size.y, || None);
+    let mut maze = Field2d::new(size.x, size.y, || None::<Dir4>);
     let mut distances_a = Field2d::new(size.x, size.y, || 0);
     let mut root = size / 2;
 
     let mut pos = root;
-    let mut stack = vec![];
-
     let mut max_dist = 0;
+    let mut stack = vec![];
 
     'genloop: loop {
         let mut dirs = Dir4::ALL;
@@ -81,19 +96,6 @@ fn main() {
     let mut distances_b = distances_a.clone();
     let mut distances_src = &mut distances_a;
     let mut distances_dst = if !IMMEDIATE_DISTANCES {
-        // for y in 0..HEIGHT {
-        //     for x in 0..WIDTH {
-        //         let d = *distances_src.get([x, y]);
-
-        //         let Some(d) = d else {
-        //             continue;
-        //         };
-
-        //         *distances_src.get_mut([x, y]) = Some(d+100);
-
-        //     }
-        // }
-
         Some(&mut distances_b)
     } else {
         None
@@ -121,10 +123,22 @@ fn main() {
     let mut prev_move_dir = Dir4::Up;
     let mut continuos_max_dist = max_dist;
 
+    let mut fps_time_start = Instant::now();
+    let mut fps_counter = 0;
+    let mut fps = 0;
+
+    
+
+    let min_frame_time = Duration::from_secs_f32(1.0 / TARGET_FPS);
+
     loop {
         if stdin_activity.load(Ordering::Relaxed) {
             break;
         }
+
+        let frame_time = Instant::now();
+
+        // stdout_buf.clear();
 
         let update_start = Instant::now();
 
@@ -238,26 +252,14 @@ fn main() {
                     let dst = distances_dst.as_deref_mut().unwrap_or(distances_src);
                     *dst.get_mut(pos) = dist;
                     max_dist = max_dist.max(dist);
-
-                    for d in Dir4::ALL {
-                        let other_pos = pos.convert(|v| v as isize) + d.dir_isize();
-                        let other_pos = (other_pos + sizei) % sizei;
-                        let other_pos = other_pos.convert(|v| v as usize);
-
-                        let other_dir = *maze.get(other_pos);
-                        if other_dir == Some(d.inverted()) {
-                            trav_distances.push(other_pos);
-                        }
-                    }
                 }
             }
         }
 
-        
         if let Some(dst) = &mut distances_dst {
             std::mem::swap::<&mut _>(&mut distances_src, dst);
         }
-        
+
         if continuos_max_dist > max_dist + 100 {
             continuos_max_dist -= 100;
         } else if continuos_max_dist + 100 < max_dist {
@@ -275,16 +277,42 @@ fn main() {
             distances: distances_src,
         };
 
+        let mut stdout = std::io::stdout().lock();
+
         let draw_start = Instant::now();
 
-        draw(&image);
+        draw(&image, &mut stdout);
+
+        fps_counter += 1;
+
+        let now = Instant::now();
+        let secs = now
+            .checked_duration_since(fps_time_start)
+            .map(|d| d.as_secs_f32());
+        if let Some(secs) = secs {
+            if secs > 0.5 {
+                let fpsf = fps_counter as f32 / secs;
+                fps = fpsf.round() as u32;
+                fps_time_start = now;
+                fps_counter = 0;
+                
+            }
+        }
 
         let draw_time = draw_start.elapsed();
 
         let update_ms = update_time.as_secs_f32() * 1000.0;
         let draw_ms = draw_time.as_secs_f32() * 1000.0;
 
-        print!("Press ENTER to stop | U: {update_ms:06.01}ms | D: {draw_ms:06.01}ms | max_dist: {continuos_max_dist} -> {max_dist}                      ")
+        
+
+        write!(stdout, "Press ENTER to stop | U: {update_ms:06.01}ms | D: {draw_ms:06.01}ms | max_dist: {continuos_max_dist} -> {max_dist} | fps: {fps}     ").ok();
+        
+        let frame_time = frame_time.elapsed();
+
+        if let Some(diff) = min_frame_time.checked_sub(frame_time) {
+            thread::sleep(diff);
+        }
     }
 }
 
@@ -293,7 +321,7 @@ struct DistanceImage<'a> {
     distances: &'a Field2d<usize>,
 }
 
-impl<'a> Image2d for DistanceImage<'a> {
+impl Image2d for DistanceImage<'_> {
     fn width(&self) -> usize {
         self.distances.width()
     }
@@ -431,37 +459,31 @@ impl Image2d for RandomImage {
     }
 }
 
-fn draw(image: &dyn Image2d) {
-    let mut stdout = std::io::stdout().lock();
-
-    stdout.write_all(b"\x1b[1;1H\x1b[?25l").ok();
+fn draw<W: io::Write>(image: &dyn Image2d, w: &mut W) {
+    w.write_all(b"\x1b[1;1H\x1b[?25l").ok();
 
     for y in 0..((image.height() + 1) / 2) {
         for x in 0..image.width() {
             let pxa = image.get(x, y * 2);
             let pxb = ((y * 2) + 1 < image.height()).then(|| image.get(x, (y * 2) + 1));
 
-            stdout
-                .write_fmt(format_args!("\x1b[38;2;{};{};{}m", pxa[0], pxa[1], pxa[2]))
-                .ok();
+            w.write_fmt(format_args!("\x1b[38;2;{};{};{}m", pxa[0], pxa[1], pxa[2])).ok();
 
             match pxb {
                 Some(c) => {
-                    stdout
-                        .write_fmt(format_args!("\x1b[48;2;{};{};{}m", c[0], c[1], c[2]))
-                        .ok();
+                    w.write_fmt(format_args!("\x1b[48;2;{};{};{}m", c[0], c[1], c[2])).ok();
                 }
                 None => {
-                    stdout.write_all(b"\x1b[49m").ok();
+                    w.write_all(b"\x1b[49m").ok();
                 }
             }
 
             // '▀';
-            stdout.write_all("▀".as_bytes()).ok();
+            w.write_all("▀".as_bytes()).ok();
         }
 
-        stdout.write_all(b"\x1b[m\n").ok();
+        w.write_all(b"\x1b[m\n").ok();
     }
 
-    stdout.write_all(b"\x1b[?25h").ok();
+    w.write_all(b"\x1b[?25h").ok();
 }
